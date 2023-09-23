@@ -1,0 +1,204 @@
+import os
+import sys
+import time
+import csv
+import json
+import warnings
+import numpy as np
+import ase
+import glob
+from ase import io
+from scipy.stats import rankdata
+from scipy import interpolate
+import pandas as pd
+##torch imports
+import torch
+import torch.nn.functional as F
+from torch_geometric.data import DataLoader, Dataset, Data, InMemoryDataset
+from torch_geometric.utils import dense_to_sparse, degree, add_self_loops
+import torch_geometric.transforms as T
+from torch_geometric.utils import degree
+
+import scipy
+from scipy import interpolate
+from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
+
+structure_file_path = 'Ni5111'
+dos_file_path = 'Ni_all'
+dictionary_file = 'dictionary_default.json'
+processing_args = {'graph_max_radius': 10, 'graph_max_neighbor' : 10, "graph_max_neighbors": 10 }
+
+def get_dictionary(dictionary_file):
+    with open(dictionary_file) as f:
+        atom_dictionary = json.load(f)
+    print(atom_dictionary)
+    return atom_dictionary
+def OneHotDegree(data, max_degree, in_degree=False, cat=True):
+    idx, x = data.edge_index[1 if in_degree else 0], data.x  #获取边的索引和节点特征x
+    deg = degree(idx, data.num_nodes, dtype=torch.long)  #计算连接到节点的边的数量
+    deg = F.one_hot(deg, num_classes=max_degree + 1).to(torch.float)
+
+    if x is not None and cat:   #检查是否存在节点特征x且cat参数为True
+        x = x.view(-1, 1) if x.dim() == 1 else x  #变形为二维张量
+        data.x = torch.cat([x, deg.to(x.dtype)], dim=-1)  #将x与edge沿最后一个维度连接起来
+    else:
+        data.x = deg
+    return data
+#对输入的矩阵进行排序和筛选
+def threshold_sort(matrix, threshold, neighbors, reverse=False, adj=False):
+    mask = matrix > threshold
+    distance_matrix_trimmed = np.ma.array(matrix, mask=mask)
+    if reverse == False:
+        distance_matrix_trimmed = rankdata(
+            distance_matrix_trimmed, method="ordinal", axis=1
+        )
+    elif reverse == True:
+        distance_matrix_trimmed = rankdata(
+            distance_matrix_trimmed * -1, method="ordinal", axis=1
+        )
+    distance_matrix_trimmed = np.nan_to_num(
+        np.where(mask, np.nan, distance_matrix_trimmed)
+    )
+    distance_matrix_trimmed[distance_matrix_trimmed > neighbors + 1] = 0
+
+    if adj == False:
+        distance_matrix_trimmed = np.where(
+            distance_matrix_trimmed == 0, distance_matrix_trimmed, matrix
+        )
+        return distance_matrix_trimmed
+    elif adj == True:
+        adj_list = np.zeros((matrix.shape[0], neighbors + 1))
+        adj_attr = np.zeros((matrix.shape[0], neighbors + 1))
+        for i in range(0, matrix.shape[0]):
+            temp = np.where(distance_matrix_trimmed[i] != 0)[0]
+            adj_list[i, :] = np.pad(
+                temp,
+                pad_width=(0, neighbors + 1 - len(temp)),
+                mode="constant",
+                constant_values=0,
+            )
+            adj_attr[i, :] = matrix[i, adj_list[i, :].astype(int)]
+        distance_matrix_trimmed = np.where(
+            distance_matrix_trimmed == 0, distance_matrix_trimmed, matrix
+        )
+        return distance_matrix_trimmed, adj_list, adj_attr
+def NormalizeEdge(dataset, descriptor_label):
+    mean, std, feature_min, feature_max = GetRanges(dataset, descriptor_label)
+
+    for data in dataset:
+        data.edge_descriptor[descriptor_label] = (
+            data.edge_descriptor[descriptor_label] - feature_min
+        ) / (feature_max - feature_min)
+def GetRanges(dataset, descriptor_label):
+    mean = 0.0
+    std = 0.0
+    for index in range(0, len(dataset)):
+        if len(dataset[index].edge_descriptor[descriptor_label]) > 0:
+            if index == 0:
+                feature_max = dataset[index].edge_descriptor[descriptor_label].max()
+                feature_min = dataset[index].edge_descriptor[descriptor_label].min()
+            mean += dataset[index].edge_descriptor[descriptor_label].mean()
+            std += dataset[index].edge_descriptor[descriptor_label].std()
+            if dataset[index].edge_descriptor[descriptor_label].max() > feature_max:
+                feature_max = dataset[index].edge_descriptor[descriptor_label].max()
+            if dataset[index].edge_descriptor[descriptor_label].min() < feature_min:
+                feature_min = dataset[index].edge_descriptor[descriptor_label].min()
+
+    mean = mean / len(dataset)
+    std = std / len(dataset)
+    return mean, std, feature_min, feature_max
+##Deletes unnecessary data due to slow dataloader
+def Cleanup(data_list, entries):
+    for data in data_list:
+        for entry in entries:
+            try:
+                delattr(data, entry)
+            except Exception:
+                pass
+
+def get_dos_features(dos_file_path):
+    df = pd.read_csv(dos_file_path)
+    print(df)
+
+class GaussianSmearing(torch.nn.Module):
+    def __init__(self, start=0.0, stop=5.0, resolution=50, width=0.05, **kwargs):
+        super(GaussianSmearing, self).__init__()
+        offset = torch.linspace(start, stop, resolution)
+        # self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
+        self.coeff = -0.5 / ((stop - start) * width) ** 2
+        self.register_buffer("offset", offset)
+
+    def forward(self, dist):
+        dist = dist.unsqueeze(-1) - self.offset.view(1, -1)
+        return torch.exp(self.coeff * torch.pow(dist, 2))
+
+
+def data_processor(structure_file_path):
+    data_list = []
+    atom_dictionary = get_dictionary(dictionary_file)
+    file_names = [f for f in os.listdir(structure_file_path) if os.path.isfile(os.path.join(structure_file_path, f))]
+    length = []
+    elements = []
+    for index in range(0, 3):   #(0, len(file_name)):
+        data = Data()
+        structure_id = file_names[index]
+        ase_crystal = ase.io.read(os.path.join(structure_file_path , structure_id))
+        data.ase = ase_crystal
+        #do some counting
+        length.append(len(ase_crystal))
+        elements.append(list(set(ase_crystal.get_chemical_symbols())))
+        ##Create sparse graph from distance matrix
+        distance = ase_crystal.get_all_distances(mic=True)
+        distance_trimmed = threshold_sort(
+            distance,
+            processing_args["graph_max_radius"],
+            processing_args["graph_max_neighbors"],
+            adj=False,)
+        distance_trimmed = torch.Tensor(distance_trimmed)
+        out = dense_to_sparse(distance_trimmed)
+        edge_index = out[0]
+        edge_weight = out[1]
+        #添加自环边
+        self_loops = True
+        if self_loops == True:
+            edge_index, edge_weight = add_self_loops(
+                edge_index, edge_weight, num_nodes=len(ase_crystal), fill_value=0
+            )
+            data.edge_index = edge_index
+            data.edge_weight = edge_weight
+            distance_mask = (
+                distance_trimmed.fill_diagonal_(1) != 0
+            ).int()
+        elif self_loops == False:
+            data.edge_index = edge_index
+            data.edge_weight = edge_weight
+
+            distance_matrix_mask = (distance_trimmed != 0).int()
+
+        data.edge_descriptor = {}
+        data.edge_descriptor["distance"] = edge_weight
+        data.edge_descriptor["mask"] = distance_matrix_mask
+
+        #generate node features
+        atom_fea = np.vstack(
+            [atom_dictionary[str(data_list[index].ase.get_atomic_numbers()[i])]
+                for i in range(len(data_list[index].ase))
+            ]).astype(float)
+        data_list[index].x = torch.Tensor(atom_fea)
+    for index in range(0, len(data_list)):
+        data_list[index] = OneHotDegree(
+            data_list[index], processing_args["graph_max_neighbors"] + 1)
+        ##Generate edge features
+
+
+
+
+
+
+
+
+
+
+if __name__ == '__main__':
+    get_dos_features('Fe_all/mp-13.csv')
