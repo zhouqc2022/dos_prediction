@@ -6,27 +6,28 @@ import ase
 from ase import io
 from scipy.stats import rankdata
 from torch_geometric.data import  Dataset, Data, InMemoryDataset
-from torch_geometric.loader import DataLoader
 from torch_geometric.utils import dense_to_sparse, degree, add_self_loops
-import torch_geometric.transforms as T
-from torch_geometric.utils import degree
 import torch
 import torch.nn.functional as F
 
 
-structure_file_path = 'Ni5111'
-dos_file_path = 'Ni_all'
-dictionary_file = 'dictionary_default.json'
+structure_file_path = 'processed_dos/Fe100/structures'
+dos_summary_path = 'processed_dos/Fe100/100.0.csv'
+
+processed_path = 'processed_path/data'
+
+dictionary_file = 'config_file/dictionary_default.json'
 processing_args = {'graph_max_radius': 5, 'graph_max_neighbor' : 10, "graph_max_neighbors": 10, 'graph_edge_length': 3 }
 
-'''对结构和dos进行处理并将这些信息储存在processed_path/data.pt中'''
-def data_processor(structure_file_path, dos_data_path, processed_path):
+'''对结构和dos进行处理并将这些信息储存在data.pt中'''
+def data_processor():
     data_list = []
     atom_dictionary =  get_dictionary(dictionary_file)
     file_names = [f for f in os.listdir(structure_file_path) if os.path.isfile(os.path.join(structure_file_path, f))]
+
     for index in range(0, len(file_names)):
         data = Data()
-        structure_id = file_names[index]
+        structure_id = file_names[index]  #structure_id = mp-xxxxx.cif
         ase_crystal = ase.io.read(os.path.join(structure_file_path , structure_id))  #ase.io.read的对象包含后缀
         data.ase = ase_crystal
         distance = ase_crystal.get_all_distances(mic=True)  #distance的shape是（原子数量。原子数量）
@@ -39,7 +40,7 @@ def data_processor(structure_file_path, dos_data_path, processed_path):
         edge_index = out[0]
         edge_weight = out[1]
         #是否增加自环边
-        self_loops = True
+        self_loops = False
         if self_loops == True:
             edge_index, edge_weight = add_self_loops(edge_index, edge_weight, num_nodes=len(ase_crystal), fill_value=0)
             data.edge_index = edge_index
@@ -52,27 +53,28 @@ def data_processor(structure_file_path, dos_data_path, processed_path):
         data.edge_descriptor = {} #data.edge_descriptor 是一个自定义的属性，用于将额外的关于边（edges）的描述信息附加到 PyTorch Geometric 中的数据对象 data 上
         data.edge_descriptor["distance"] = edge_weight
         data.edge_descriptor["mask"] = distance_mask
-        #处理dos信息
-        dos_file =  os.path.join(dos_data_path, structure_id.split('.')[0] + ".csv")
-        with open (dos_file, 'r') as file:
-            lines = file.readlines()
-            energy_list = []
-            density_list = []
-            for i in lines:
-                energy_list.append(i.split(',')[0])
-                density_list.append(i.strip().split(',')[1])
-        x_list = [float(x) for x in energy_list]
-        y_list = [float(x) for x in density_list]
-        values = np.linspace(-15, 15, 200)  # dos的范围为-15eV到15eV
-        dos_feature = np.zeros(200)
-        feature_index = 0
-        for i in values:
-            nearest_value = min(x_list, key=lambda x: abs(x - i))
-            index = x_list.index(nearest_value)
-            dos_feature[feature_index] = y_list[index]
-            feature_index += 1
-        data.y=torch.Tensor(dos_feature).view(1,-1)
+        print('processing {}, all number of data is {}'.format(structure_id, len(file_names)))
+
+
+        #处理与dos有关的data.y信息
+        dos_feature = None
+        with open(dos_summary_path, 'r') as file:
+            dos_lines = file.readlines()
+
+        for x in dos_lines:
+
+            if x.split(',')[0] == structure_id.split('.')[0]:
+                dos_feature = x.split(',')[1:]
+            else:
+                pass
+        dos_feature = [float(x) for x in dos_feature]
+        data.y = torch.Tensor(dos_feature).view(1, -1)
+        print(data.y.shape)
+
+
         data_list.append(data)
+
+
     #generate node features
     for index in range(0, len(data_list)):#len(file_names)):
         atom_fea = np.vstack([atom_dictionary[str(data_list[index].ase.get_atomic_numbers()[i])]
@@ -91,31 +93,30 @@ def data_processor(structure_file_path, dos_data_path, processed_path):
     Cleanup(data_list, ["ase", "edge_descriptor"])
     data, slices = InMemoryDataset.collate(data_list)
     #保存数据
-    save_file_path = os.path.join(processed_path, "data.pt")
+    save_file_path = os.path.join(processed_path, '20', 'data100.pt')
     if os.path.exists(save_file_path):
         os.remove(save_file_path)
-
     torch.save((data, slices), save_file_path)
     return data, slices
 
 '''将数据加载为structuredataset类的实例'''
-def get_dataset(data_path, target_index, reprocess="False", processing_args=None):
-    if processing_args == None:
-        transforms = GetY(index=target_index)
-        if os.path.exists(data_path) == False:
-            print('data not found in:', data_path)
-            sys.exit()
-        if os.path.exists(data_path) == True:
-            dataset = StructureDataset(
-                data_path,
-                'processed',
-                transforms,)
-    else:
+def get_dataset(data_path, target_index):
+    transforms = GetY(index=target_index)
+    if os.path.exists(data_path) == False:
+        print('data not found in:', data_path)
         sys.exit()
+    else:
+        dataset = StructureDataset(
+            data_path,
+            '',
+            transforms,
+        )
     return dataset
+
+'''StructureDataset类，继承自InMemoryDataset'''
 class StructureDataset(InMemoryDataset):
     def __init__(
-        self, data_path, processed_path="processed", transform=None, pre_transform=None): #接受四个参数
+        self, data_path, processed_path='', transform=None, pre_transform=None): #接受四个参数
         self.data_path = data_path
         self.processed_path = processed_path
         super(StructureDataset, self).__init__(data_path, transform, pre_transform)  #将三个参数传递给父类
@@ -129,42 +130,35 @@ class StructureDataset(InMemoryDataset):
         return os.path.join(self.data_path, self.processed_path)
     @property
     def processed_file_names(self):
-        file_names = ["data.pt"]
+        file_names = ['data.pt']
         return file_names
 
 '''种子的主要作用是确保每次运行程序时，通过随机生成的序列都是可复制的'''
-def split_data(dataset, train_ratio, val_ratio, test_ratio, seed=np.random.randint(1, 1e6), save=False,):
+def split_data(dataset, train_ratio, val_ratio, test_ratio, seed=np.random.randint(1, 1e6),):
     dataset_size = len(dataset)
-    if (train_ratio + val_ratio + test_ratio) <= 1:
-        train_length = int(dataset_size * train_ratio)
-        val_length = int(dataset_size * val_ratio)
-        test_length = int(dataset_size * test_ratio)
-        unused_length = dataset_size - train_length - val_length - test_length
-        (
-            train_dataset,
-            val_dataset,
-            test_dataset,
-            unused_dataset,
+    all_ratio = train_ratio + val_ratio + test_ratio
+    train_ratio = train_ratio/all_ratio
+    val_ratio = val_ratio/all_ratio
+    test_ratio = test_ratio/all_ratio
+
+    train_length = int(dataset_size * train_ratio)
+    val_length = int(dataset_size * val_ratio)
+    test_length = int(dataset_size * test_ratio)
+    unused_length = dataset_size - train_length - val_length - test_length
+    (
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        unused_dataset,
         ) = torch.utils.data.random_split(
             dataset,
             [train_length, val_length, test_length, unused_length],
             generator=torch.Generator().manual_seed(seed),
         )
-        print(
-            "train length:",
-            train_length,
-            "val length:",
-            val_length,
-            "test length:",
-            test_length,
-            "unused length:",
-            unused_length,
-            "seed :",
-            seed,
-        )
-        return train_dataset, val_dataset, test_dataset
-    else:
-        print("invalid ratios")
+    print('train length, val length, test length, unused length, seed is {},,{}, {}, {}'.format(train_length, val_length, test_length, unused_length))
+
+    return train_dataset, val_dataset, test_dataset
+
 
 '''the followings are all tools'''
 #index = -1时不作修改，否则会将data.y元素的子元素赋值给data.y
@@ -244,7 +238,6 @@ def GetRanges(dataset, descriptor_label):
                 feature_max = dataset[index].edge_descriptor[descriptor_label].max()
             if dataset[index].edge_descriptor[descriptor_label].min() < feature_min:
                 feature_min = dataset[index].edge_descriptor[descriptor_label].min()
-
     mean = mean / len(dataset)
     std = std / len(dataset)
     return mean, std, feature_min, feature_max
@@ -272,9 +265,4 @@ class GaussianSmearing(torch.nn.Module):
 
 
 if __name__ == '__main__':
-    data_processor('Cu_structure','Cu_dos', 'processed_path')
-
-
-
-
-
+    data_processor()
